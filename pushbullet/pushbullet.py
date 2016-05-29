@@ -1,11 +1,19 @@
+import os
 import json
 import requests
+from base64 import standard_b64encode
 
 from .device import Device
 from .channel import Channel
 from .chat import Chat
 from .errors import PushbulletError, InvalidKeyError, PushError
 from .filetype import get_file_type
+
+
+class NoEncryptionModuleError(Exception):
+    def __init__(self, msg):
+        super(NoEncryptionModuleError, self).__init__(
+            "cryptography is required for end-to-end encryption support and could not be imported: " + msg)
 
 
 class Pushbullet(object):
@@ -18,7 +26,7 @@ class Pushbullet(object):
     UPLOAD_REQUEST_URL = "https://api.pushbullet.com/v2/upload-request"
     EPHEMERALS_URL = "https://api.pushbullet.com/v2/ephemerals"
 
-    def __init__(self, api_key):
+    def __init__(self, api_key, encryption_password=None):
         self.api_key = api_key
         self._json_header = {'Content-Type': 'application/json'}
 
@@ -27,6 +35,24 @@ class Pushbullet(object):
         self._session.headers.update(self._json_header)
 
         self.refresh()
+
+        self._encryption_key = None
+        if encryption_password:
+            try:
+                from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+                from cryptography.hazmat.backends import default_backend
+                from cryptography.hazmat.primitives import hashes
+            except ImportError as e:
+                raise NoEncryptionModuleError(str(e))
+
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=self.user_info['iden'].encode("ASCII"),
+                iterations=300000,
+                backend=default_backend()
+            )
+            self._encryption_key = kdf.derive(encryption_password.encode("UTF-8"))
 
     def _get_data(self, url):
         resp = self._session.get(url)
@@ -285,9 +311,27 @@ class Pushbullet(object):
                 "source_user_iden": self.user_info['iden'],
                 "target_device_iden": device.device_iden,
                 "conversation_iden": number,
-                "message": message
             }
         }
+
+        if self._encryption_key:
+            from cryptography.hazmat.primitives.ciphers import (
+                Cipher, algorithms, modes
+            )
+            from cryptography.hazmat.backends import default_backend
+
+            iv = os.urandom(12)
+            encryptor = Cipher(
+                algorithms.AES(self._encryption_key),
+                modes.GCM(iv),
+                backend=default_backend()
+            ).encryptor()
+
+            message = encryptor.update(message.encode("UTF-8")) + encryptor.finalize()
+            message = b"1" + encryptor.tag + iv + message
+            data["encoded_message"] = standard_b64encode(message).decode("ASCII")
+        else:
+            data["message"] = message
 
         r = self._session.post(self.EPHEMERALS_URL, data=json.dumps(data))
         if r.status_code == requests.codes.ok:
